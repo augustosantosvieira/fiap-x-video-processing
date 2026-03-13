@@ -2,8 +2,8 @@ import pytest
 import sys
 import os
 
-# Força o Python a enxergar a pasta 'api'
-sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+# Magia: Ensina o Python a voltar uma pasta (..) para achar a API (main.py)
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from fastapi.testclient import TestClient
 from main import app
