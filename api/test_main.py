@@ -1,5 +1,11 @@
 import pytest
+import sys
+import os
 from fastapi.testclient import TestClient
+
+# Estas duas linhas mágicas forçam o Python a procurar os arquivos na pasta atual (api/)
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+
 from main import app
 
 client = TestClient(app)
