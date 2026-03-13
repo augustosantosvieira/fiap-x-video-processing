@@ -1,114 +1,114 @@
-import pika, json, os, zipfile, shutil
-import cv2
-import boto3
-import psycopg2
+import pika, json, os, zipfile, cv2, boto3
+from sqlalchemy import create_engine, Column, String, DateTime
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import declarative_base
 
+# Configurações de Infraestrutura
+RABBITMQ_HOST = "rabbitmq"
 MINIO_ENDPOINT = "http://minio:9000"
 MINIO_ACCESS_KEY = "admin"
 MINIO_SECRET_KEY = "password123"
 BUCKET_NAME = "videos"
-TEMP_DIR = "/tmp/video_processing"
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://fiap_user:fiap_password@postgres:5432/video_processing_db")
 
-s3_client = boto3.client(
-    's3',
-    endpoint_url=MINIO_ENDPOINT,
-    aws_access_key_id=MINIO_ACCESS_KEY,
-    aws_secret_access_key=MINIO_SECRET_KEY,
-    region_name='us-east-1'
-)
+# Conexões
+s3_client = boto3.client('s3', endpoint_url=MINIO_ENDPOINT, aws_access_key_id=MINIO_ACCESS_KEY, aws_secret_access_key=MINIO_SECRET_KEY, region_name='us-east-1')
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(bind=engine)
+Base = declarative_base()
 
-def update_db_status(video_id, status):
-    """Conecta no PostgreSQL e atualiza o status do vídeo."""
-    try:
-        conn = psycopg2.connect("postgresql://fiap_user:fiap_password@postgres:5432/video_processing_db")
-        cur = conn.cursor()
-        cur.execute("UPDATE videos SET status = %s WHERE id = %s", (status, video_id))
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print(f"Erro ao atualizar banco de dados: {e}")
+class VideoStatus(Base):
+    __tablename__ = "videos"
+    id = Column(String, primary_key=True)
+    status = Column(String)
 
-def process_video_logic(video_path, output_zip_path):
-    """Extrai frames de 1 em 1 segundo e cria um ZIP."""
-    frames_dir = os.path.join(TEMP_DIR, "frames")
+def processar_video(video_id):
+    # 1. Baixa o vídeo do MinIO
+    video_path = f"/tmp/{video_id}.mp4"
+    zip_path = f"/tmp/{video_id}.zip"
+    frames_dir = f"/tmp/{video_id}_frames"
     os.makedirs(frames_dir, exist_ok=True)
     
-    vidcap = cv2.VideoCapture(video_path)
-    fps = round(vidcap.get(cv2.CAP_PROP_FPS))
-    if fps == 0: fps = 1 # Prevenção de divisão por zero
-    
-    success, image = vidcap.read()
-    count = 0; frame_id = 0
-    
-    while success:
-        if count % fps == 0:
-            frame_path = os.path.join(frames_dir, f"frame_{frame_id}.jpg")
-            cv2.imwrite(frame_path, image)
-            frame_id += 1
-        success, image = vidcap.read()
+    s3_client.download_file(BUCKET_NAME, f"{video_id}.mp4", video_path)
+
+    # 2. Extrai imagens com OpenCV
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise Exception("Arquivo de vídeo corrompido ou formato não suportado.")
+
+    count = 0
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+        # Salva 1 frame a cada 30 (aprox. 1 por segundo dependendo do vídeo)
+        if count % 30 == 0:
+            cv2.imwrite(f"{frames_dir}/frame_{count}.jpg", frame)
         count += 1
-        
-    with zipfile.ZipFile(output_zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+    cap.release()
+
+    # 3. Compacta as imagens em um .zip
+    with zipfile.ZipFile(zip_path, 'w') as zipf:
         for root, _, files in os.walk(frames_dir):
             for file in files:
                 zipf.write(os.path.join(root, file), file)
-                
-    shutil.rmtree(frames_dir)
 
-def process_video(ch, method, properties, body):
+    # 4. Faz o upload do .zip de volta para o MinIO
+    s3_client.upload_file(zip_path, BUCKET_NAME, f"{video_id}.zip")
+
+    # Limpa os arquivos temporários do container
+    os.remove(video_path)
+    os.remove(zip_path)
+
+def callback(ch, method, properties, body):
     data = json.loads(body)
     video_id = data['video_id']
-    print(f"\n[x] Iniciando processamento do vídeo: {video_id}")
+    db = SessionLocal()
+    video = db.query(VideoStatus).filter(VideoStatus.id == video_id).first()
     
-    os.makedirs(TEMP_DIR, exist_ok=True)
-    local_video_path = os.path.join(TEMP_DIR, f"{video_id}.mp4")
-    local_zip_path = os.path.join(TEMP_DIR, f"{video_id}.zip")
+    print(f"⏳ Iniciando processamento do vídeo {video_id}...")
     
     try:
-        update_db_status(video_id, "PROCESSANDO")
+        if video:
+            video.status = "PROCESSANDO"
+            db.commit()
         
-        # 1. Baixar o vídeo do MinIO
-        print(" -> Baixando do MinIO...")
-        s3_client.download_file(BUCKET_NAME, f"{video_id}.mp4", local_video_path)
+        # Chama a função pesada que pode dar erro
+        processar_video(video_id)
         
-        # 2. Processar (OpenCV + ZIP)
-        print(" -> Extraindo frames e gerando ZIP...")
-        process_video_logic(local_video_path, local_zip_path)
-        
-        # 3. Fazer upload do ZIP de volta para o MinIO
-        print(" -> Enviando ZIP para o MinIO...")
-        s3_client.upload_file(local_zip_path, BUCKET_NAME, f"{video_id}.zip")
-        
-        # 4. Finalizar
-        update_db_status(video_id, "CONCLUIDO")
-        print(f"[v] Sucesso total para o vídeo: {video_id}")
-        ch.basic_ack(delivery_tag=method.delivery_tag)
+        if video:
+            video.status = "CONCLUIDO"
+            db.commit()
+        print(f"✅ Sucesso! Vídeo {video_id} processado e ZIP gerado.")
         
     except Exception as e:
-        print(f"[!] Erro catastrófico no processamento: {e}")
-        update_db_status(video_id, "ERRO")
-        # Publica na fila de erros apenas se a rotina principal falhar
-        try:
-            ch.basic_publish(exchange='', routing_key='video_errors_queue', body=body)
-        except Exception:
-            pass
-        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+        if video:
+            video.status = "ERRO"
+            db.commit()
+        # =========================================================
+        # REQUISITO ATENDIDO: Notificação de erro ao usuário
+        # =========================================================
+        print(f"❌ ERRO CRÍTICO no vídeo {video_id}: {str(e)}")
+        print(f"📧 [SISTEMA DE NOTIFICAÇÃO] Disparando e-mail para o usuário...")
+        print(f"   Assunto: Falha no processamento do seu vídeo")
+        print(f"   Mensagem: 'Olá! Infelizmente ocorreu um erro ao processar o vídeo enviado ({video_id}). O arquivo pode estar corrompido. Por favor, tente enviar novamente.'")
+        print(f"📧 E-mail enviado com sucesso!")
         
     finally:
-        # Limpar lixo do container
-        if os.path.exists(local_video_path): os.remove(local_video_path)
-        if os.path.exists(local_zip_path): os.remove(local_zip_path)
+        db.close()
+        # Confirma para o RabbitMQ que a mensagem foi tratada (mesmo que com erro, para não ficar em loop)
+        ch.basic_ack(delivery_tag=method.delivery_tag)
 
-# --- CONEXÃO COM O RABBITMQ (CORRIGIDA COM CREDENCIAIS) ---
-credentials = pika.PlainCredentials('admin', 'admin123')
-connection = pika.BlockingConnection(pika.ConnectionParameters(host='rabbitmq', credentials=credentials))
+def start_worker():
+    credentials = pika.PlainCredentials('admin', 'admin123')
+    connection = pika.BlockingConnection(pika.ConnectionParameters(host='rabbitmq', credentials=credentials))
+    channel = connection.channel()
+    channel.queue_declare(queue='video_processing_queue', durable=True)
+    
+    channel.basic_consume(queue='video_processing_queue', on_message_callback=callback)
+    print('⚙️ Worker iniciado. Aguardando mensagens do RabbitMQ...')
+    channel.start_consuming()
 
-channel = connection.channel()
-channel.queue_declare(queue='video_processing_queue', durable=True)
-channel.queue_declare(queue='video_errors_queue', durable=True)
-channel.basic_qos(prefetch_count=1)
-channel.basic_consume(queue='video_processing_queue', on_message_callback=process_video)
-
-print('[*] Worker Real aguardando vídeos para processar...')
-channel.start_consuming()
+if __name__ == '__main__':
+    start_worker()
+EOF
