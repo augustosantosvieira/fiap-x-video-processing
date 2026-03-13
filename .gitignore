@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+venv/
+env/
+
+# Temporários de vídeo e zip
+/tmp/
+*.mp4
+*.zip
+*.jpg
+
+# IDEs
+.vscode/
+.idea/

@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+pika
+python-multipart
+sqlalchemy
+psycopg2-binary
+pyjwt
+passlib[bcrypt]
+boto3

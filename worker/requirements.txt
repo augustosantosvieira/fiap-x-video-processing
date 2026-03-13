@@ -1,0 +1,4 @@
+pika
+opencv-python-headless
+psycopg2-binary
+boto3
