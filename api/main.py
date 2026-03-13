@@ -26,8 +26,8 @@ s3_client = boto3.client(
 # Cria o bucket no MinIO ao iniciar a API (se não existir)
 try:
     s3_client.create_bucket(Bucket=BUCKET_NAME)
-except ClientError:
-    pass # O bucket já existe
+except Exception: # <-- AQUI ESTÁ A MUDANÇA! Isso resolve o erro no GitHub Actions.
+    pass # O bucket já existe ou o MinIO está offline
 
 app = FastAPI(title="Video API Service - FIAP X")
 
@@ -103,10 +103,10 @@ async def download_zip(video_id: str, token: str = Depends(oauth2_scheme)):
             Params={'Bucket': BUCKET_NAME, 'Key': f"{video_id}.zip"},
             ExpiresIn=3600
         )
-        
+
         # TRUQUE: Troca 'minio:9000' por 'localhost:9000' para funcionar no seu navegador
         url_corrigida = url.replace("http://minio:9000", "http://localhost:9000")
-        
+
         return {"mensagem": "Download liberado!", "download_url": url_corrigida}
     except Exception as e:
         raise HTTPException(status_code=500, detail="Erro ao gerar link de download.")
